@@ -18,6 +18,8 @@ function App() {
   const [rul, setRul] = useState(null);
   const [rulLoading, setRulLoading] = useState(false);
   const [rulHistory, setRulHistory] = useState([]);
+  const [lastSeen, setLastSeen] = useState(null);
+  const [lastIp, setLastIp] = useState(null);
 
   // Function to send one sample value to the backend
   const sendSample = async () => {
@@ -89,6 +91,56 @@ function App() {
     })();
   }, []);
 
+  // Poll server-side history produced by ESP -> /sample -> DB
+  useEffect(() => {
+    let mounted = true;
+    const fetchHistory = async () => {
+      try {
+        const res = await fetch(`${API_URL}/history?sensor_id=${encodeURIComponent(sensorId)}&limit=200`);
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!mounted || !data || !Array.isArray(data.history)) return;
+        const hist = data.history;
+        if (hist.length === 0) return;
+        const last = hist[hist.length - 1];
+        // update prediction state from last stored prediction
+        if (last.state !== undefined && last.state !== null) {
+          const st = Number(last.state);
+          setPrediction(Number.isFinite(st) ? st : last.state);
+          // map numeric state to label if labelMap available
+          setPredictionLabel(labelMap && labelMap[String(st)] ? labelMap[String(st)] : null);
+        }
+        // set last contact info if present
+        if (last.ts) {
+          setLastSeen(new Date(Math.round(last.ts * 1000)));
+        }
+        if (last.ip) {
+          setLastIp(last.ip);
+        }
+        // update values timeline from history states (optional)
+        setRulHistory((prev) => {
+          const seq = hist.map(h => Number(h.state));
+          const merged = [...prev, ...seq].slice(-200);
+          return merged;
+        });
+        // refresh RUL after history update so UI stays in sync with server-side calculations
+        try {
+          await predictRUL();
+        } catch (e) {
+          console.error('predictRUL after history failed', e);
+        }
+      } catch (err) {
+        console.error("Failed to fetch history:", err);
+      }
+    };
+    fetchHistory();
+    const iv = setInterval(fetchHistory, 2000); // poll every 2s
+    return () => {
+      mounted = false;
+      clearInterval(iv);
+    };
+  }, [API_URL, sensorId, labelMap]);
+
   // Fetch RUL from backend and update state
   const predictRUL = async () => {
     setRulLoading(true);
@@ -132,20 +184,7 @@ function App() {
             />
           </div>
           <div className="flex gap-2 items-center">
-            <input
-              type="number"
-              value={newValue}
-              onChange={(e) => setNewValue(e.target.value)}
-              placeholder="Enter sensor value"
-              className="border px-2 py-1 rounded-md"
-            />
-            <button
-              onClick={sendSample}
-              disabled={loading}
-              className="bg-indigo-600 hover:bg-indigo-700 text-white font-semibold px-4 py-2 rounded-md disabled:bg-gray-400"
-            >
-              {loading ? "Sending..." : "Send"}
-            </button>
+            {/* Manual send removed; readings come from device */}
           </div>
         </div>
 
@@ -218,6 +257,9 @@ function App() {
 
         {statusMsg && (
           <p className="mt-2 text-sm text-gray-600">{statusMsg}</p>
+        )}
+        {lastSeen && (
+          <p className="mt-1 text-sm text-gray-500">Last contact: {lastIp ? `${lastIp} — ` : ''}{lastSeen.toLocaleString()}</p>
         )}
 
         {/* RUL Display Card */}

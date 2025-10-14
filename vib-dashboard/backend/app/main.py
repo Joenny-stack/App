@@ -159,14 +159,36 @@ def init_db(path: Optional[str] = None):
                 )
                 """
             )
+            # enable WAL for better concurrent performance when available
+            try:
+                conn.execute('PRAGMA journal_mode=WAL')
+            except Exception:
+                pass
+            # ensure an index for fast lookups by sensor and time
+            try:
+                conn.execute('CREATE INDEX IF NOT EXISTS idx_sensor_ts ON sensor_history(sensor_id, ts)')
+            except Exception:
+                pass
+            # attempt to add ip column if not present (no-op if column exists)
+            try:
+                conn.execute("ALTER TABLE sensor_history ADD COLUMN ip TEXT")
+            except Exception:
+                pass
     finally:
         conn.close()
 
 
-def append_history_db(sensor_id: str, ts: float, state):
+def append_history_db(sensor_id: str, ts: float, state, ip: Optional[str] = None):
     try:
         conn = sqlite3.connect(DB_PATH)
         with conn:
+            if ip is not None:
+                try:
+                    conn.execute("INSERT INTO sensor_history (sensor_id, ts, state, ip) VALUES (?, ?, ?, ?)", (sensor_id, float(ts), str(state), str(ip)))
+                    return
+                except Exception:
+                    # fallback to insert without ip if schema not migrated
+                    pass
             conn.execute("INSERT INTO sensor_history (sensor_id, ts, state) VALUES (?, ?, ?)", (sensor_id, float(ts), str(state)))
     except Exception as e:
         logger.warning(f"Failed to append history to DB: {e}")
@@ -181,9 +203,15 @@ def read_history_db(sensor_id: str, limit: int = 1000):
     try:
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
-        cur.execute("SELECT ts, state FROM sensor_history WHERE sensor_id = ? ORDER BY ts ASC LIMIT ?", (sensor_id, limit))
-        rows = cur.fetchall()
-        return [(float(r[0]), r[1]) for r in rows]
+        # attempt to select ip if present
+        try:
+            cur.execute("SELECT ts, state, ip FROM sensor_history WHERE sensor_id = ? ORDER BY ts ASC LIMIT ?", (sensor_id, limit))
+            rows = cur.fetchall()
+            return [(float(r[0]), r[1], (r[2] if len(r) > 2 else None)) for r in rows]
+        except Exception:
+            cur.execute("SELECT ts, state FROM sensor_history WHERE sensor_id = ? ORDER BY ts ASC LIMIT ?", (sensor_id, limit))
+            rows = cur.fetchall()
+            return [(float(r[0]), r[1], None) for r in rows]
     except Exception as e:
         logger.warning(f"Failed to read history from DB: {e}")
         return []
@@ -348,9 +376,14 @@ async def sample_endpoint(request: Request):
             # append (timestamp, state) to memory
             state_val = int(pred_int) if pred_int is not None else str(y_pred)
             hist.append((recorded_ts, state_val))
-            # also persist to DB
+            # also persist to DB, include client IP if available
             try:
-                append_history_db(sensor_id, recorded_ts, state_val)
+                client_ip = None
+                try:
+                    client_ip = request.client.host
+                except Exception:
+                    client_ip = None
+                append_history_db(sensor_id, recorded_ts, state_val, ip=client_ip)
             except Exception:
                 pass
             # keep history bounded to recent 1000 entries
@@ -422,6 +455,36 @@ def label_map_endpoint():
         return JSONResponse(status_code=500, content={"error": "Could not retrieve label map"})
 
 
+@app.get("/history")
+def history_endpoint(sensor_id: str = None, limit: int = 200):
+    """Return recent stored prediction history for a sensor.
+
+    Response: { "sensor_id": "esp1", "history": [ {"ts": <float>, "state": <int|string>}, ... ] }
+    """
+    try:
+        if not sensor_id:
+            return JSONResponse(status_code=400, content={"error": "sensor_id query parameter required"})
+        rows = read_history_db(sensor_id, limit=limit)
+        history = []
+        for row in rows:
+            # row can be (ts, state) or (ts, state, ip)
+            ts = row[0]
+            state = row[1]
+            ip = row[2] if len(row) > 2 else None
+            try:
+                st = int(state)
+            except Exception:
+                st = state
+            hist_item = {"ts": float(ts), "state": st}
+            if ip is not None:
+                hist_item["ip"] = ip
+            history.append(hist_item)
+        return {"sensor_id": sensor_id, "history": history}
+    except Exception as e:
+        logger.error(f"history endpoint failed: {e}")
+        return JSONResponse(status_code=500, content={"error": "Could not read history"})
+
+
 @app.get("/rul")
 def rul_endpoint(sensor_id: str = None):
     """
@@ -444,17 +507,44 @@ def rul_endpoint(sensor_id: str = None):
                     hist = db_rows
 
         if hist and len(hist) > 1:
-            # hist: list of (timestamp, state)
-            previous_state = hist[0][1]
-            start_ts = hist[0][0]
-            for ts, st in hist[1:]:
+            # hist entries may be (ts, state) or (ts, state, ip)
+            def unpack(item):
+                # return (ts, state)
+                if not item:
+                    return None, None
+                try:
+                    ts_val = float(item[0])
+                except Exception:
+                    ts_val = None
+                st_val = item[1] if len(item) > 1 else None
+                return ts_val, st_val
+
+            first_ts, first_state = unpack(hist[0])
+            previous_state = first_state
+            start_ts = first_ts
+            for item in hist[1:]:
+                ts, st = unpack(item)
+                if st is None:
+                    continue
                 if st != previous_state:
                     # record segment in seconds
-                    time_state[int(previous_state)].append((start_ts, ts))
+                    try:
+                        key = int(previous_state)
+                    except Exception:
+                        key = 0
+                    time_state[key].append((start_ts, ts))
                     start_ts = ts
                     previous_state = st
             # finalize last
-            time_state[int(previous_state)].append((start_ts, hist[-1][0]))
+            try:
+                last_ts = unpack(hist[-1])[0]
+            except Exception:
+                last_ts = start_ts
+            try:
+                key = int(previous_state)
+            except Exception:
+                key = 0
+            time_state[key].append((start_ts, last_ts))
             units = "minutes"
             # compute RUL using timestamp differences (seconds -> minutes)
             # convert timestamps (seconds since epoch) to minutes when computing durations
