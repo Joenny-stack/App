@@ -12,6 +12,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from scipy.stats import skew as _skew, kurtosis as _kurtosis
+import sqlite3
+from typing import Optional
 
 # ==============================================
 #  CONFIGURATION
@@ -140,6 +142,64 @@ SENSOR_BUFFERS = {}
 SENSOR_STATE_HISTORY = {}  # sensor_id -> list of (timestamp, state) tuples
 WINDOW_SIZE = int(os.environ.get("WINDOW_SIZE", "10"))  # reduced for local testing; set to 256 in production
 WINDOW_STEP = int(os.environ.get("WINDOW_STEP", str(WINDOW_SIZE)))
+DB_PATH = os.path.join(BASE_DIR, "sensor_history.sqlite")
+
+
+def init_db(path: Optional[str] = None):
+    p = path or DB_PATH
+    conn = sqlite3.connect(p)
+    try:
+        with conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sensor_history (
+                    sensor_id TEXT NOT NULL,
+                    ts REAL NOT NULL,
+                    state TEXT NOT NULL
+                )
+                """
+            )
+    finally:
+        conn.close()
+
+
+def append_history_db(sensor_id: str, ts: float, state):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        with conn:
+            conn.execute("INSERT INTO sensor_history (sensor_id, ts, state) VALUES (?, ?, ?)", (sensor_id, float(ts), str(state)))
+    except Exception as e:
+        logger.warning(f"Failed to append history to DB: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def read_history_db(sensor_id: str, limit: int = 1000):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT ts, state FROM sensor_history WHERE sensor_id = ? ORDER BY ts ASC LIMIT ?", (sensor_id, limit))
+        rows = cur.fetchall()
+        return [(float(r[0]), r[1]) for r in rows]
+    except Exception as e:
+        logger.warning(f"Failed to read history from DB: {e}")
+        return []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# initialize DB on import
+try:
+    init_db()
+    logger.info(f"Initialized sensor history DB at {DB_PATH}")
+except Exception as e:
+    logger.warning(f"Could not initialize DB: {e}")
 
 
 def compute_obs_from_window(window_samples):
@@ -285,8 +345,14 @@ async def sample_endpoint(request: Request):
             if hist is None:
                 hist = []
                 SENSOR_STATE_HISTORY[sensor_id] = hist
-            # append (timestamp, state)
-            hist.append((recorded_ts, int(pred_int) if pred_int is not None else str(y_pred)))
+            # append (timestamp, state) to memory
+            state_val = int(pred_int) if pred_int is not None else str(y_pred)
+            hist.append((recorded_ts, state_val))
+            # also persist to DB
+            try:
+                append_history_db(sensor_id, recorded_ts, state_val)
+            except Exception:
+                pass
             # keep history bounded to recent 1000 entries
             if len(hist) > 1000:
                 del hist[:-1000]
@@ -371,6 +437,11 @@ def rul_endpoint(sensor_id: str = None):
         hist = None
         if sensor_id:
             hist = SENSOR_STATE_HISTORY.get(sensor_id)
+            if not hist or len(hist) == 0:
+                # try reading from DB
+                db_rows = read_history_db(sensor_id, limit=1000)
+                if db_rows:
+                    hist = db_rows
 
         if hist and len(hist) > 1:
             # hist: list of (timestamp, state)
