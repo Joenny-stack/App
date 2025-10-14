@@ -13,11 +13,17 @@ function App() {
   const [sensorId, setSensorId] = useState("esp1");
   const [newValue, setNewValue] = useState("");
   const [loading, setLoading] = useState(false);
+  const [labelMap, setLabelMap] = useState({0: 'Healthy', 1: 'Degraded', 2: 'Faulty'});
+  // RUL client state
+  const [rul, setRul] = useState(null);
+  const [rulLoading, setRulLoading] = useState(false);
+  const [rulHistory, setRulHistory] = useState([]);
 
   // Function to send one sample value to the backend
   const sendSample = async () => {
     if (!newValue) return;
-    const payload = { sensor_id: sensorId, value: parseFloat(newValue) };
+    // include client timestamp (UTC seconds) so server can compute accurate durations
+    const payload = { sensor_id: sensorId, value: parseFloat(newValue), timestamp: Math.floor(Date.now() / 1000) };
     setLoading(true);
     try {
       const res = await fetch(`${API_URL}/sample`, {
@@ -27,10 +33,11 @@ function App() {
       });
       const data = await res.json();
 
-      if (data.prediction || data.label) {
-        // store raw prediction and any server-provided label
-        setPrediction(data.prediction ?? data.label);
-        setPredictionLabel(data.label ?? null);
+      // Treat numeric 0 as a valid prediction (don't use truthiness)
+      if (data.prediction !== undefined && data.prediction !== null) {
+        // store raw prediction; ignore any server-provided label (handled client-side)
+        setPrediction(data.prediction);
+        setPredictionLabel(null);
         setStatusMsg("✅ Prediction ready");
         setBufferLen(0);
       } else if (data.status === "buffering") {
@@ -46,6 +53,8 @@ function App() {
 
       setValues((prev) => [...prev.slice(-99), parseFloat(newValue)]);
       setNewValue("");
+      // Request updated RUL from the backend (fire-and-forget)
+      predictRUL().catch((e) => console.error('predictRUL failed', e));
     } catch (err) {
       console.error("Send error:", err);
       setStatusMsg("⚠️ Connection or server error");
@@ -63,6 +72,46 @@ function App() {
     line: { shape: "spline" },
     marker: { size: 4 },
     name: "Sensor Values",
+  };
+
+  // fetch label map from server on mount
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch(`${API_URL}/label-map`);
+        const data = await res.json();
+        if (data && data.label_map) {
+          setLabelMap(data.label_map);
+        }
+      } catch (e) {
+        // ignore and use defaults
+      }
+    })();
+  }, []);
+
+  // Fetch RUL from backend and update state
+  const predictRUL = async () => {
+    setRulLoading(true);
+    try {
+      const q = new URLSearchParams({ sensor_id: sensorId }).toString();
+      const res = await fetch(`${API_URL}/rul?${q}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      if (data) {
+        setRul(data);
+        // prefer mean if present, else try 'rul'
+        const meanVal = (typeof data.rul_mean === 'number') ? data.rul_mean : (typeof data.rul === 'number' ? data.rul : null);
+        if (meanVal !== null) {
+          setRulHistory((prev) => [...prev.slice(-99), Number(meanVal)]);
+        }
+        setStatusMsg("✅ RUL updated");
+      }
+    } catch (e) {
+      console.error('RUL prediction error:', e);
+      setStatusMsg('⚠️ RUL fetch failed');
+    } finally {
+      setRulLoading(false);
+    }
   };
 
   return (
@@ -105,33 +154,26 @@ function App() {
           <h2 className="text-lg font-semibold text-gray-700 mb-2">
             Health State Prediction:
           </h2>
-          {prediction ? (
+          {prediction !== null && prediction !== undefined ? (
             (() => {
               // Try to interpret common numeric/class outputs
-              // If server provided a label, prefer that
-              const serverLabel = predictionLabel;
-              if (serverLabel) {
-                return (
-                  <div>
-                    <p className={`text-xl font-bold text-indigo-600`}>{serverLabel} <span className="text-sm text-gray-500">({prediction})</span></p>
-                    <p className="mt-2 text-sm text-gray-600">Server-provided label</p>
-                  </div>
-                );
-              }
-
               const num = Number(prediction);
               let label = prediction;
               let colorClass = "text-indigo-600";
+              let activeIndex = null;
 
+              // Map numeric outputs using labelMap from server (or fallback)
               if (!Number.isNaN(num)) {
-                if (num === 0) {
-                  label = "Healthy";
-                  colorClass = "text-green-600";
-                } else if (num === 1) {
-                  label = "Faulty";
-                  colorClass = "text-red-600";
+                const mapped = Object.prototype.hasOwnProperty.call(labelMap, num) ? labelMap[num] : null;
+                if (mapped) {
+                  label = mapped;
+                  // choose color by mapping key
+                  if (num === 0) colorClass = "text-green-600";
+                  else if (num === 1) colorClass = "text-yellow-600";
+                  else if (num === 2) colorClass = "text-red-600";
+                  else colorClass = "text-indigo-600";
+                  activeIndex = [0,1,2].includes(num) ? num : null;
                 } else {
-                  // numeric but not 0/1 — show as a score
                   label = `Score: ${Number.isInteger(num) ? num : num.toFixed(3)}`;
                   colorClass = "text-indigo-600";
                 }
@@ -141,15 +183,32 @@ function App() {
                 colorClass = "text-indigo-600";
               }
 
+              // state scale visualization
+              const states = [
+                { key: 0, label: 'Healthy', color: 'bg-green-500' },
+                { key: 1, label: 'Degraded', color: 'bg-yellow-500' },
+                { key: 2, label: 'Faulty', color: 'bg-red-500' },
+              ];
+
               return (
                 <div>
                   <p className={`text-xl font-bold ${colorClass}`}>{label} <span className="text-sm text-gray-500">({prediction})</span></p>
-                  <p className="mt-2 text-sm text-gray-600">
-                    Interpretation: {num === 0 ? '0 typically means the system is healthy.' : num === 1 ? '1 typically means a fault or unhealthy state.' : 'This value is the raw model output.'}
-                  </p>
-                  <p className="mt-1 text-xs text-gray-400">
-                    Note: If your trained model uses different labels (for example strings or probabilities), we can surface those from the backend.
-                  </p>
+
+                  <div className="mt-3">
+                    <div className="w-full bg-gray-200 rounded-full h-8 overflow-hidden flex">
+                      {states.map((s, i) => (
+                        <div
+                          key={s.key}
+                          className={`${s.color} flex-1 flex items-center justify-center text-white text-sm font-semibold ${activeIndex === i ? 'ring-2 ring-offset-1 ring-indigo-300' : 'opacity-80'}`}
+                        >
+                          {s.label}
+                        </div>
+                      ))}
+                    </div>
+                    <p className="mt-2 text-sm text-gray-600">
+                      Interpretation: {activeIndex === 0 ? '0 = Healthy' : activeIndex === 1 ? '1 = Degraded' : activeIndex === 2 ? '2 = Faulty' : 'This value is the raw model output.'}
+                    </p>
+                  </div>
                 </div>
               );
             })()
@@ -160,6 +219,42 @@ function App() {
         {statusMsg && (
           <p className="mt-2 text-sm text-gray-600">{statusMsg}</p>
         )}
+
+        {/* RUL Display Card */}
+        <div className="mt-4">
+          <div className="bg-white border rounded-md p-4">
+            <h3 className="text-md font-semibold text-gray-700">Remaining Useful Life</h3>
+            {rul ? (
+              <div className="mt-2 grid grid-cols-1 sm:grid-cols-3 gap-3 items-center">
+                <div>
+                  <p className="text-sm text-gray-500">Mean</p>
+                  <p className="text-xl font-bold text-indigo-600">{typeof rul.rul_mean === 'number' ? rul.rul_mean.toFixed(2) : String(rul.rul_mean ?? '—')} <span className="text-sm text-gray-500">{rul.units ?? ''}</span></p>
+                </div>
+                <div>
+                  <p className="text-sm text-gray-500">Upper</p>
+                  <p className="text-xl font-bold text-green-600">{typeof rul.rul_upper === 'number' ? rul.rul_upper.toFixed(2) : String(rul.rul_upper ?? '—')} <span className="text-sm text-gray-500">{rul.units ?? ''}</span></p>
+                </div>
+                <div>
+                  <p className="text-sm text-gray-500">Lower</p>
+                  <p className="text-xl font-bold text-red-600">{typeof rul.rul_lower === 'number' ? rul.rul_lower.toFixed(2) : String(rul.rul_lower ?? '—')} <span className="text-sm text-gray-500">{rul.units ?? ''}</span></p>
+                </div>
+
+                {rulHistory.length > 0 && (
+                  <div className="sm:col-span-3 mt-2">
+                    <Plot
+                      data={[{ x: rulHistory.map((_, i) => i), y: rulHistory, type: 'scatter', mode: 'lines+markers', line: { color: '#6366F1' } }]}
+                      layout={{ width: '100%', height: 140, margin: { t: 10, b: 30, l: 30, r: 10 }, paper_bgcolor: 'transparent', plot_bgcolor: 'transparent', showlegend:false }}
+                      style={{ width: '100%' }}
+                      useResizeHandler
+                    />
+                  </div>
+                )}
+              </div>
+            ) : (
+              <p className="text-sm text-gray-500 mt-2">No RUL prediction yet.</p>
+            )}
+          </div>
+        </div>
 
         {/* Progress bar */}
         {bufferLen > 0 && (
