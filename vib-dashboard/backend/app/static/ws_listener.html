@@ -1,0 +1,21 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>WS Listener</title>
+</head>
+<body>
+  <h1>WebSocket Prediction Listener</h1>
+  <div id="status">Disconnected</div>
+  <pre id="log"></pre>
+  <script>
+    const log = (m) => { const p = document.getElementById('log'); p.textContent += m + '\n'; };
+    const status = document.getElementById('status');
+    const ws = new WebSocket('ws://' + location.host + '/ws');
+    ws.onopen = () => { status.textContent = 'Connected'; log('Connected to ws'); };
+    ws.onmessage = (e) => { log('MSG: ' + e.data); };
+    ws.onclose = () => { status.textContent = 'Closed'; log('Closed'); };
+    ws.onerror = (e) => { status.textContent = 'Error'; log('Error: ' + e); };
+  </script>
+</body>
+</html>
