@@ -101,7 +101,9 @@ function App() {
         const data = await res.json();
         if (!mounted || !data || !Array.isArray(data.history)) return;
         const hist = data.history;
-        if (hist.length === 0) return;
+  if (hist.length === 0) return;
+  // debug: show raw history payload received from server
+  console.debug('history payload', hist);
         const last = hist[hist.length - 1];
         // update prediction state from last stored prediction
         if (last.state !== undefined && last.state !== null) {
@@ -123,7 +125,8 @@ function App() {
           const merged = [...prev, ...seq].slice(-200);
           return merged;
         });
-        const historyValues = hist.map(h => (typeof h.value === 'number' ? h.value : null)).filter(v => v !== null);
+  const historyValues = hist.map(h => (typeof h.value === 'number' ? h.value : null)).filter(v => v !== null);
+  console.debug('historyValues -> setValues count', historyValues.length, 'examples', historyValues.slice(-10));
         if (historyValues.length > 0) {
           setValues(historyValues.slice(-200));
         }
