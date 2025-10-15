@@ -53,7 +53,7 @@ function App() {
           setBufferLen(0);
       }
 
-  setValues((prev) => [...prev.slice(-99), { ts: Math.floor(Date.now() / 1000), value: parseFloat(newValue) }]);
+      setValues((prev) => [...prev.slice(-99), parseFloat(newValue)]);
       setNewValue("");
       // Request updated RUL from the backend (fire-and-forget)
       predictRUL().catch((e) => console.error('predictRUL failed', e));
@@ -65,10 +65,10 @@ function App() {
     }
   };
 
-  // Plot trace for raw sensor values (timestamps on x-axis)
+  // Plot trace for raw sensor values
   const trace = {
-    x: values.map(v => new Date(Math.round(v.ts * 1000))),
-    y: values.map(v => v.value),
+    x: values.map((_, i) => i),
+    y: values,
     type: "scatter",
     mode: "lines+markers",
     line: { shape: "spline" },
@@ -125,10 +125,10 @@ function App() {
           const merged = [...prev, ...seq].slice(-200);
           return merged;
         });
-        const historyValuesFull = hist.map(h => ({ ts: h.ts, value: (typeof h.value === 'number' ? h.value : null) })).filter(h => h.value !== null);
-        console.debug('historyValues -> setValues count', historyValuesFull.length, 'examples', historyValuesFull.slice(-10));
-        if (historyValuesFull.length > 0) {
-          setValues(historyValuesFull.slice(-200));
+  const historyValues = hist.map(h => (typeof h.value === 'number' ? h.value : null)).filter(v => v !== null);
+  console.debug('historyValues -> setValues count', historyValues.length, 'examples', historyValues.slice(-10));
+        if (historyValues.length > 0) {
+          setValues(historyValues.slice(-200));
         }
         // refresh RUL after history update so UI stays in sync with server-side calculations
         try {
@@ -329,10 +329,7 @@ function App() {
             Raw Vibration Signals
           </h2>
           <Plot
-            data={[
-              trace,
-              ...(rul && rul.as_of ? [{ x: [new Date(Math.round(rul.as_of * 1000))], y: [rul.rul_mean ?? null], type: 'scatter', mode: 'markers', marker: { color: 'orange', size: 10 }, name: 'RUL (minutes)' }] : []),
-            ]}
+            data={[trace]}
             layout={{
               width: "100%",
               height: 400,

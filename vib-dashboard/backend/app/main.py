@@ -604,9 +604,7 @@ def rul_endpoint(sensor_id: str = None):
             for s, segments in time_state.items():
                 time_state_in_minutes[s] = [((seg[0] / 60.0), (seg[1] / 60.0)) for seg in segments]
             rul_upper, rul_mean, rul_lower = rul_calc(time_state_in_minutes, 0.95)
-            # include the timestamp the RUL was computed for (seconds since epoch)
-            as_of = float(last_ts) if last_ts is not None else float(pd.Timestamp.utcnow().timestamp())
-            return {"rul_upper": float(rul_upper), "rul_mean": float(rul_mean), "rul_lower": float(rul_lower), "units": units, "as_of": as_of}
+            return {"rul_upper": float(rul_upper), "rul_mean": float(rul_mean), "rul_lower": float(rul_lower), "units": units}
         else:
             # fallback synthetic timeline consistent with training: 10-minute intervals
             time_state = {0: [], 1: [], 2: []}
@@ -640,11 +638,11 @@ def rul_endpoint(sensor_id: str = None):
                 time_rul.append([x[-1], rul_upper, rul_mean, rul_lower])
 
             if not state_rul:
-                return {"rul_upper": 0.0, "rul_mean": 0.0, "rul_lower": 0.0, "units": "minutes", "as_of": float(pd.Timestamp.utcnow().timestamp())}
+                return {"rul_upper": 0.0, "rul_mean": 0.0, "rul_lower": 0.0, "units": "minutes"}
 
             df_rul = pd.DataFrame(state_rul, columns=['RUL UPPER', 'RUL MEAN', 'RUL LOWER'])
             latest = df_rul.iloc[-1].to_dict()
-            return {"rul_upper": float(latest['RUL UPPER']), "rul_mean": float(latest['RUL MEAN']), "rul_lower": float(latest['RUL LOWER']), "units": "minutes", "as_of": float(pd.Timestamp.utcnow().timestamp())}
+            return {"rul_upper": float(latest['RUL UPPER']), "rul_mean": float(latest['RUL MEAN']), "rul_lower": float(latest['RUL LOWER']), "units": "minutes"}
     except Exception as e:
         logger.error(f"RUL computation failed: {e}")
         return JSONResponse(status_code=500, content={"error": "RUL computation failed"})
