@@ -509,7 +509,7 @@ def history_endpoint(sensor_id: str = None, limit: int = 200):
         rows = read_history_db(sensor_id, limit=limit)
         history = []
         for row in rows:
-                # row can be (ts, state, ip, value) or (ts, state, ip, None)
+            # row can be (ts, state, ip, value) or (ts, state, ip, None)
             ts = row[0]
             state = row[1]
             ip = row[2] if len(row) > 2 else None
@@ -517,10 +517,11 @@ def history_endpoint(sensor_id: str = None, limit: int = 200):
                 st = int(state)
             except Exception:
                 st = state
-                hist_item = {"ts": float(ts), "state": st}
-                value = row[3] if len(row) > 3 else None
-                if value is not None:
-                    hist_item["value"] = value
+            # always build the hist_item
+            hist_item = {"ts": float(ts), "state": st}
+            value = row[3] if len(row) > 3 else None
+            if value is not None:
+                hist_item["value"] = value
             if ip is not None:
                 hist_item["ip"] = ip
             history.append(hist_item)
