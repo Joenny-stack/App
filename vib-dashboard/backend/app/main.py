@@ -415,9 +415,13 @@ async def sample_endpoint(request: Request):
             if hist is None:
                 hist = []
                 SENSOR_STATE_HISTORY[sensor_id] = hist
-            # append (timestamp, state) to memory
+            # append (timestamp, state, raw_value) to memory so frontend can plot raw samples
             state_val = int(pred_int) if pred_int is not None else str(y_pred)
-            hist.append((recorded_ts, state_val))
+            try:
+                raw_value = float(val)
+            except Exception:
+                raw_value = None
+            hist.append((recorded_ts, state_val, raw_value))
             # also persist to DB, include client IP if available
             try:
                 client_ip = None
@@ -425,7 +429,8 @@ async def sample_endpoint(request: Request):
                     client_ip = request.client.host
                 except Exception:
                     client_ip = None
-                append_history_db(sensor_id, recorded_ts, state_val, ip=client_ip)
+                # pass (state, raw_value) tuple so append_history_db can insert the value column
+                append_history_db(sensor_id, recorded_ts, (state_val, raw_value), ip=client_ip)
             except Exception:
                 pass
             # keep history bounded to recent 1000 entries
