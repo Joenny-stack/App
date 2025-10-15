@@ -174,6 +174,11 @@ def init_db(path: Optional[str] = None):
                 conn.execute("ALTER TABLE sensor_history ADD COLUMN ip TEXT")
             except Exception:
                 pass
+            # attempt to add raw sample value column if not present
+            try:
+                conn.execute("ALTER TABLE sensor_history ADD COLUMN value REAL")
+            except Exception:
+                pass
     finally:
         conn.close()
 
@@ -182,14 +187,28 @@ def append_history_db(sensor_id: str, ts: float, state, ip: Optional[str] = None
     try:
         conn = sqlite3.connect(DB_PATH)
         with conn:
+            # prefer to insert value if present in state tuple
+            raw_value = None
+            try:
+                # if caller passed state as (state_val, raw_value)
+                if isinstance(state, (list, tuple)) and len(state) == 2:
+                    state_val, raw_value = state
+                    state = state_val
+            except Exception:
+                pass
+
             if ip is not None:
                 try:
-                    conn.execute("INSERT INTO sensor_history (sensor_id, ts, state, ip) VALUES (?, ?, ?, ?)", (sensor_id, float(ts), str(state), str(ip)))
+                    conn.execute("INSERT INTO sensor_history (sensor_id, ts, state, ip, value) VALUES (?, ?, ?, ?, ?)", (sensor_id, float(ts), str(state), str(ip), float(raw_value) if raw_value is not None else None))
                     return
                 except Exception:
                     # fallback to insert without ip if schema not migrated
                     pass
-            conn.execute("INSERT INTO sensor_history (sensor_id, ts, state) VALUES (?, ?, ?)", (sensor_id, float(ts), str(state)))
+            # final fallback
+            try:
+                conn.execute("INSERT INTO sensor_history (sensor_id, ts, state, value) VALUES (?, ?, ?, ?)", (sensor_id, float(ts), str(state), float(raw_value) if raw_value is not None else None))
+            except Exception:
+                conn.execute("INSERT INTO sensor_history (sensor_id, ts, state) VALUES (?, ?, ?)", (sensor_id, float(ts), str(state)))
     except Exception as e:
         logger.warning(f"Failed to append history to DB: {e}")
     finally:
@@ -205,13 +224,13 @@ def read_history_db(sensor_id: str, limit: int = 1000):
         cur = conn.cursor()
         # attempt to select ip if present
         try:
-            cur.execute("SELECT ts, state, ip FROM sensor_history WHERE sensor_id = ? ORDER BY ts ASC LIMIT ?", (sensor_id, limit))
+            cur.execute("SELECT ts, state, ip, value FROM sensor_history WHERE sensor_id = ? ORDER BY ts ASC LIMIT ?", (sensor_id, limit))
             rows = cur.fetchall()
-            return [(float(r[0]), r[1], (r[2] if len(r) > 2 else None)) for r in rows]
+            return [(float(r[0]), r[1], (r[2] if len(r) > 2 else None), (float(r[3]) if len(r) > 3 and r[3] is not None else None)) for r in rows]
         except Exception:
-            cur.execute("SELECT ts, state FROM sensor_history WHERE sensor_id = ? ORDER BY ts ASC LIMIT ?", (sensor_id, limit))
+            cur.execute("SELECT ts, state, value FROM sensor_history WHERE sensor_id = ? ORDER BY ts ASC LIMIT ?", (sensor_id, limit))
             rows = cur.fetchall()
-            return [(float(r[0]), r[1], None) for r in rows]
+            return [(float(r[0]), r[1], None, (float(r[2]) if r[2] is not None else None)) for r in rows]
     except Exception as e:
         logger.warning(f"Failed to read history from DB: {e}")
         return []
@@ -233,10 +252,34 @@ except Exception as e:
 def compute_obs_from_window(window_samples):
     """Compute [mean, rms, kurtosis, skew] for a window of samples."""
     arr = np.asarray(window_samples, dtype=float)
+    # empty window -> zero features
+    if arr.size == 0:
+        return np.zeros((1, 4), dtype=float)
+
     mean = float(np.mean(arr))
     rms = float(np.sqrt(np.mean(arr ** 2)))
-    kurt = float(_kurtosis(arr, fisher=False, bias=False))
-    sk = float(_skew(arr, bias=False))
+
+    # If the window is nearly constant, avoid catastrophic cancellation
+    if np.allclose(arr, arr.flat[0], atol=1e-8, rtol=1e-5):
+        kurt = 0.0
+        sk = 0.0
+    else:
+        # suppress scipy runtime warnings and guard against NaN/Inf
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            try:
+                kurt = float(_kurtosis(arr, fisher=False, bias=False))
+            except Exception:
+                kurt = 0.0
+            try:
+                sk = float(_skew(arr, bias=False))
+            except Exception:
+                sk = 0.0
+        if not np.isfinite(kurt):
+            kurt = 0.0
+        if not np.isfinite(sk):
+            sk = 0.0
+
     obs = np.array([mean, rms, kurt, sk], dtype=float)
     # Prepare the observation for the scaler. Some StandardScaler instances
     # were fitted on a DataFrame and expect feature names; transforming a
@@ -245,12 +288,8 @@ def compute_obs_from_window(window_samples):
     if scaler:
         try:
             # If the scaler was fitted with feature names, present a DataFrame
-            # with identical column names so transform behaves without warnings.
             if hasattr(scaler, "feature_names_in_"):
                 cols = list(getattr(scaler, "feature_names_in_"))
-                # Only use a DataFrame wrapper when the scaler's feature names
-                # match our expected number of features. Otherwise sklearn will
-                # warn and may misalign columns; fallback to numeric array.
                 if len(cols) == X.shape[1]:
                     X_df = pd.DataFrame(X, columns=cols)
                     Xt = scaler.transform(X_df)
@@ -259,14 +298,17 @@ def compute_obs_from_window(window_samples):
                     Xt = scaler.transform(X)
             else:
                 Xt = scaler.transform(X)
-            # ensure we return a 2D numpy array
-            obs = np.asarray(Xt).reshape(1, -1)
+
+            # ensure 2D numpy array and sanitize NaN/Inf from scaler output
+            Xt = np.asarray(Xt).reshape(1, -1)
+            Xt = np.nan_to_num(Xt, nan=0.0, posinf=1e6, neginf=-1e6)
+            obs = Xt
         except Exception as e:
-            # If scaling fails for any reason, log and continue with raw features
             logger.warning(f"Scaler transform failed, continuing without scaling: {e}")
-            obs = X.reshape(1, -1)
+            obs = np.nan_to_num(X.reshape(1, -1), nan=0.0, posinf=1e6, neginf=-1e6)
     else:
-        obs = X.reshape(1, -1)
+        obs = np.nan_to_num(X.reshape(1, -1), nan=0.0, posinf=1e6, neginf=-1e6)
+
     return obs
 
 
@@ -467,7 +509,7 @@ def history_endpoint(sensor_id: str = None, limit: int = 200):
         rows = read_history_db(sensor_id, limit=limit)
         history = []
         for row in rows:
-            # row can be (ts, state) or (ts, state, ip)
+                # row can be (ts, state, ip, value) or (ts, state, ip, None)
             ts = row[0]
             state = row[1]
             ip = row[2] if len(row) > 2 else None
@@ -475,7 +517,10 @@ def history_endpoint(sensor_id: str = None, limit: int = 200):
                 st = int(state)
             except Exception:
                 st = state
-            hist_item = {"ts": float(ts), "state": st}
+                hist_item = {"ts": float(ts), "state": st}
+                value = row[3] if len(row) > 3 else None
+                if value is not None:
+                    hist_item["value"] = value
             if ip is not None:
                 hist_item["ip"] = ip
             history.append(hist_item)

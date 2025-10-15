@@ -117,12 +117,16 @@ function App() {
         if (last.ip) {
           setLastIp(last.ip);
         }
-        // update values timeline from history states (optional)
+        // update values timeline from history 'value' field when available
         setRulHistory((prev) => {
           const seq = hist.map(h => Number(h.state));
           const merged = [...prev, ...seq].slice(-200);
           return merged;
         });
+        const historyValues = hist.map(h => (typeof h.value === 'number' ? h.value : null)).filter(v => v !== null);
+        if (historyValues.length > 0) {
+          setValues(historyValues.slice(-200));
+        }
         // refresh RUL after history update so UI stays in sync with server-side calculations
         try {
           await predictRUL();
